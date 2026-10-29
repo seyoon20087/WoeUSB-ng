@@ -179,7 +179,7 @@ def main(source_fs_mountpoint, target_fs_mountpoint, source_media, target_media,
 
         if target_filesystem_type == "NTFS":
             create_uefi_ntfs_support_partition(target_device)
-            install_uefi_ntfs_support_partition(target_device + "2", temp_directory)
+            install_uefi_ntfs_support_partition(utils.get_partition_path(target_device, 2), temp_directory)
 
     if install_mode == "partition":
         utils.check_target_partition(target_partition, target_device)

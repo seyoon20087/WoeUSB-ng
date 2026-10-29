@@ -95,14 +95,68 @@ def check_runtime_parameters(install_mode, source_media, target_media):
         print_with_color(_("Error: Target media \"{0}\" is not a block device file!").format(target_media), "red")
         return 1
 
-    if install_mode == "device" and target_media[-1].isdigit():
+    if install_mode == "device" and is_partition(target_media):
         print_with_color(_("Error: Target media \"{0}\" is not an entire storage device!").format(target_media), "red")
         return 1
 
-    if install_mode == "partition" and not target_media[-1].isdigit():
+    if install_mode == "partition" and not is_partition(target_media):
         print_with_color(_("Error: Target media \"{0}\" is not an partition!").format(target_media), "red")
         return 1
+
+    # Partitions of a loop device only show up when it is attached with partition scanning enabled
+    loop_partscan_path = get_sysfs_block_path(target_media) + "/loop/partscan"
+    if install_mode == "device" and os.path.isfile(loop_partscan_path):
+        with open(loop_partscan_path) as partscan:
+            if partscan.read().strip() != "1":
+                print_with_color(
+                    _("Error: Loop device \"{0}\" doesn't have partition scanning enabled, "
+                      "re-attach it with `losetup --partscan` then try again").format(target_media), "red")
+                return 1
     return 0
+
+
+def get_sysfs_block_path(block_device):
+    """
+    :param block_device: Block device file, for example /dev/sdX or /dev/loopXpX
+    :return: The device's sysfs directory, for example /sys/class/block/sdX
+    """
+    return "/sys/class/block/" + os.path.basename(os.path.realpath(block_device))
+
+
+def is_partition(block_device):
+    """
+    Whether the block device is a partition rather than an entire device,
+    the kernel exposes a "partition" sysfs item only for partitions
+
+    :param block_device: Block device file
+    :return: True if the block device is a partition
+    """
+    return os.path.isfile(get_sysfs_block_path(block_device) + "/partition")
+
+
+def get_parent_device(partition):
+    """
+    :param partition: Partition device file, for example /dev/sdX1, /dev/nvmeXnYpZ or /dev/loopXpY
+    :return: The device file of the entire device the partition resides in
+    """
+    sysfs_partition_path = os.path.realpath(get_sysfs_block_path(partition))
+    return "/dev/" + os.path.basename(os.path.dirname(sysfs_partition_path))
+
+
+def get_partition_path(device, partition_number):
+    """
+    Follows the kernel's partition naming convention: a "p" separator is
+    inserted when the device name ends with a digit, so /dev/sdX becomes
+    /dev/sdX1 while /dev/loopX, /dev/nvmeXnY and /dev/mmcblkX become
+    /dev/loopXp1, /dev/nvmeXnYp1 and /dev/mmcblkXp1
+
+    :param device: Entire device file
+    :param partition_number: Number of the partition
+    :return: The partition's device file
+    """
+    if device[-1].isdigit():
+        return device + "p" + str(partition_number)
+    return device + str(partition_number)
 
 
 def determine_target_parameters(install_mode, target_media):
@@ -113,13 +167,10 @@ def determine_target_parameters(install_mode, target_media):
     """
     if install_mode == "partition":
         target_partition = target_media
-
-        while target_media[-1].isdigit():
-            target_media = target_media[:-1]
-        target_device = target_media
+        target_device = get_parent_device(target_media)
     else:
         target_device = target_media
-        target_partition = target_media + str(1)
+        target_partition = get_partition_path(target_media, 1)
 
     if verbose:
         print_with_color(_("Info: Target device is {0}").format(target_device))
@@ -134,8 +185,10 @@ def check_is_target_device_busy(device):
     :return:
     """
     mount = subprocess.run("mount", stdout=subprocess.PIPE).stdout.decode("utf-8").strip()
-    if re.findall(device, mount) != []:
-        mounts = re.findall(rf'{device}\S*', mount)
+    # Match the device itself and its partitions (/dev/sdX1, /dev/loopXpY), but not other devices sharing the prefix
+    partition_suffix = "p[0-9]+" if device[-1].isdigit() else "[0-9]+"
+    mounts = re.findall(rf'^{re.escape(device)}(?:{partition_suffix})?(?= )', mount, re.MULTILINE)
+    if mounts != []:
         print_with_color(_("Warning: The following partitions will be unmounted: {0}").format(mounts), "yellow")
         for partition in mounts:
             if subprocess.run(["umount", partition]).returncode:
