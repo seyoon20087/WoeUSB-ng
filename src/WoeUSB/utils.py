@@ -23,6 +23,9 @@ except ImportError:
 gui = None
 verbose = False
 
+#: Max fat32 file size
+FAT32_FILESIZE_LIMIT = (2 ** 32) - 1
+
 
 def check_runtime_dependencies(application_name):
     """
@@ -174,7 +177,15 @@ def check_fat32_filesize_limitation(source_fs_mountpoint):
     for dirpath, dirnames, filenames in os.walk(source_fs_mountpoint):
         for file in filenames:
             path = os.path.join(dirpath, file)
-            if os.path.getsize(path) > (2 ** 32) - 1:  # Max fat32 file size
+            if os.path.getsize(path) > FAT32_FILESIZE_LIMIT:
+                # Oversized WIM images can be split into smaller parts using wimlib
+                if path.lower().endswith(".wim") and shutil.which("wimlib-imagex") is not None:
+                    print_with_color(
+                        _("Info: File {0} in source image has exceed the FAT32 Filesystem 4GiB Single File Size Limitation, it will be split into multiple parts.").format(
+                            path),
+                        "yellow")
+                    continue
+
                 print_with_color(
                     _(
                         "Warning: File {0} in source image has exceed the FAT32 Filesystem 4GiB Single File Size Limitation, swiching to NTFS filesystem.").format(

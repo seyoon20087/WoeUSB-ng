@@ -33,6 +33,9 @@ debug = False
 
 CopyFiles_handle = threading.Thread()
 
+#: wimlib-imagex process splitting an oversized WIM image, needs to be killed during cleanup
+wimlib_imagex_process = None
+
 #: Execution state for cleanup functions to determine if clean up is required
 current_state = 'pre-init'
 
@@ -191,7 +194,7 @@ def main(source_fs_mountpoint, target_fs_mountpoint, source_media, target_media,
 
     current_state = "copying-filesystem"
 
-    copy_filesystem_files(source_fs_mountpoint, target_fs_mountpoint)
+    copy_filesystem_files(source_fs_mountpoint, target_fs_mountpoint, target_filesystem_type)
 
     workaround.support_windows_7_uefi_boot(source_fs_mountpoint, target_fs_mountpoint)
     if not skip_legacy_bootloader:
@@ -441,12 +444,13 @@ def mount_target_filesystem(target_partition, target_fs_mountpoint):
         return 1
 
 
-def copy_filesystem_files(source_fs_mountpoint, target_fs_mountpoint):
+def copy_filesystem_files(source_fs_mountpoint, target_fs_mountpoint, target_filesystem_type="FAT"):
     """
     Copying all files from one filesystem to another, with progress reporting
 
     :param source_fs_mountpoint:
     :param target_fs_mountpoint:
+    :param target_filesystem_type:
     :return: None
     """
     global CopyFiles_handle
@@ -473,7 +477,14 @@ def copy_filesystem_files(source_fs_mountpoint, target_fs_mountpoint):
             path = os.path.join(dirpath, file)
             CopyFiles_handle.file = path
 
-            if os.path.getsize(path) > 5 * 1024 * 1024:  # Files bigger than 5 MiB
+            if target_filesystem_type == "FAT" and os.path.getsize(path) > utils.FAT32_FILESIZE_LIMIT:
+                if path.lower().endswith(".wim"):
+                    copy_oversized_wim_file(path, target_fs_mountpoint + path.replace(source_fs_mountpoint, ""))
+                else:
+                    utils.print_with_color(
+                        _("Warning: Unsupported oversized file \"{0}\" detected, this file will NOT be transferred.").format(path),
+                        "yellow")
+            elif os.path.getsize(path) > 5 * 1024 * 1024:  # Files bigger than 5 MiB
                 copy_large_file(path, target_fs_mountpoint + path.replace(source_fs_mountpoint, ""))
             else:
                 shutil.copy2(path, target_fs_mountpoint + path.replace(source_fs_mountpoint, ""))
@@ -506,6 +517,42 @@ def copy_large_file(source, target):
 
     source_file.close()
     target_file.close()
+
+
+def copy_oversized_wim_file(source, target):
+    """
+    Copy WIM files that is over 4GiB to a FAT32 filesystem
+    Using wimlib to split file into smaller parts (install.swm, install2.swm, ...)
+
+    :param source:
+    :param target:
+    :return: None
+    """
+    global wimlib_imagex_process
+
+    target_basename = target[:-len(".wim")]
+
+    # Split WIM image using wimtools to fit FAT32 restriction
+    # Optimal split file size: 4GiB - 1MiB = 4095MiB
+    wimlib_imagex_process = subprocess.Popen(["wimlib-imagex", "split", source, target_basename + ".swm", "4095"],
+                                             stdout=subprocess.DEVNULL)
+
+    # Progress is reported by ReportCopyProgress which sums up the target filesystem
+    while wimlib_imagex_process.poll() is None:
+        try:
+            utils.check_kill_signal()
+        except BaseException:
+            wimlib_imagex_process.kill()
+            wimlib_imagex_process.wait()
+            raise
+
+        time.sleep(0.2)
+
+    returncode = wimlib_imagex_process.returncode
+    wimlib_imagex_process = None
+
+    if returncode != 0:
+        raise RuntimeError("wimlib-imagex failed to split " + source)
 
 
 def install_legacy_pc_bootloader_grub(target_fs_mountpoint, target_device, command_grubinstall):
@@ -580,6 +627,10 @@ def cleanup(source_fs_mountpoint, target_fs_mountpoint, temp_directory, target_m
     """
     if CopyFiles_handle.is_alive():
         CopyFiles_handle.stop = True
+
+    if wimlib_imagex_process is not None and wimlib_imagex_process.poll() is None:
+        wimlib_imagex_process.kill()
+        wimlib_imagex_process.wait()
 
     flag_unclean = False
     flag_unsafe = False
